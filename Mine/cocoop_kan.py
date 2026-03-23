@@ -87,16 +87,20 @@ print(f"New  classes ({len(new_classes)}): {[EUROSAT_CLASSES[c] for c in new_cla
 # Use ordered list of all classes (base + new) for model / label mapping
 all_classes = base_classes + new_classes
 
+# Global label maps (computed once)
+label_map_all = {c: i for i, c in enumerate(all_classes)}
+base_label_rel = {c: i for i, c in enumerate(base_classes)}
+
 # Train loader: few-shot on base classes only (with augmentation)
 num_workers = min(4, (os.cpu_count() or 1))
 pin_memory = True if "cuda" in DEVICE else False
 train_dataset = EuroSATFewShot(DATA_ROOT, base_classes, NUM_SHOTS, transform=train_transform)
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,
+train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True,
                           num_workers=num_workers, pin_memory=pin_memory)
 
 # Test loader: all samples (no augmentation)
 test_dataset = EuroSAT(root=DATA_ROOT, transform=test_transform)
-test_loader = DataLoader(test_dataset, batch_size=64,
+test_loader = DataLoader(test_dataset, batch_size=1,
                          num_workers=num_workers, pin_memory=pin_memory)
 
 print("Data loaders created.", flush=True)
@@ -131,6 +135,23 @@ class TextEncoder(nn.Module):
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
 
         return x
+
+class KanLayer(nn.Module):
+    """Efficient 'Kan' bottleneck with gating."""
+    def __init__(self, in_dim, out_dim, hidden=None):
+        super().__init__()
+        if hidden is None:
+            hidden = max(in_dim // 16, 4)
+        self.fc1 = nn.Linear(in_dim, hidden)
+        self.fc2 = nn.Linear(hidden, out_dim)
+        self.gate = nn.Linear(in_dim, out_dim)
+
+    def forward(self, x):
+        # x: (B, in_dim)
+        h = F.relu(self.fc1(x))
+        out = self.fc2(h)                # (B, out_dim)
+        g = torch.sigmoid(self.gate(x))  # (B, out_dim)
+        return out * g
 
 
 # ── Model ────────────────────────────────────────────────────────
@@ -294,15 +315,14 @@ def train_one_epoch(epoch):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Train]", leave=False)
     for images, labels in pbar:
         images = images.to(DEVICE)
-        # Map labels → indices in ALL classes (consistent with model outputs)
-        label_map = {c: i for i, c in enumerate(all_classes)}
-        labels = torch.tensor([label_map[int(l.item())] for l in labels]).to(DEVICE)
+        labels_rel = torch.tensor([base_label_rel[int(l.item())] for l in labels], dtype=torch.long).to(DEVICE)
 
         # Forward / backward with autocast when using AMP
         if scaler is not None:
             with torch.amp.autocast(device_type='cuda'):
                 logits = model(images)
-                loss = criterion(logits, labels)
+                logits_base = logits[:, :len(base_classes)]
+                loss = criterion(logits_base, labels_rel)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -310,7 +330,8 @@ def train_one_epoch(epoch):
             scaler.update()
         else:
             logits = model(images)
-            loss = criterion(logits, labels)
+            logits_base = logits[:, :len(base_classes)]
+            loss = criterion(logits_base, labels_rel)
 
             optimizer.zero_grad()
             loss.backward()
@@ -337,8 +358,7 @@ def evaluate():
     model.eval()
 
     # Unified class ordering and label map (same as training)
-    label_map = {c: i for i, c in enumerate(all_classes)}
-    label_to_idx = label_map
+    label_to_idx = label_map_all
 
     correct_base = 0
     total_base = 0
@@ -360,6 +380,7 @@ def evaluate():
 
             preds = logits_batch.argmax(dim=1).tolist()
 
+            # Accumulate metrics (small Python loop over batch is fine)
             for i in range(B):
                 pred = preds[i]
                 label = labels[i].item()

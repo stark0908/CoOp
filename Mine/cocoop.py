@@ -87,16 +87,23 @@ print(f"New  classes ({len(new_classes)}): {[EUROSAT_CLASSES[c] for c in new_cla
 # Use ordered list of all classes (base + new) for model / label mapping
 all_classes = base_classes + new_classes
 
+# Global label maps (computed once)
+# label_map_all: dataset class_id -> position in model outputs (all_classes ordering)
+label_map_all = {c: i for i, c in enumerate(all_classes)}
+# base_label_rel: dataset class_id (only for base classes) -> 0..(n_base-1)
+base_label_rel = {c: i for i, c in enumerate(base_classes)}
+
 # Train loader: few-shot on base classes only (with augmentation)
+# Batch size = 1 for deterministic per-instance prompts
 num_workers = min(4, (os.cpu_count() or 1))
 pin_memory = True if "cuda" in DEVICE else False
 train_dataset = EuroSATFewShot(DATA_ROOT, base_classes, NUM_SHOTS, transform=train_transform)
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,
+train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True,
                           num_workers=num_workers, pin_memory=pin_memory)
 
 # Test loader: all samples (no augmentation)
 test_dataset = EuroSAT(root=DATA_ROOT, transform=test_transform)
-test_loader = DataLoader(test_dataset, batch_size=64,
+test_loader = DataLoader(test_dataset, batch_size=1,
                          num_workers=num_workers, pin_memory=pin_memory)
 
 print("Data loaders created.", flush=True)
@@ -285,15 +292,15 @@ def train_one_epoch(epoch):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Train]", leave=False)
     for images, labels in pbar:
         images = images.to(DEVICE)
-        # Map labels → indices in ALL classes (consistent with model outputs)
-        label_map = {c: i for i, c in enumerate(all_classes)}
-        labels = torch.tensor([label_map[int(l.item())] for l in labels]).to(DEVICE)
+        # labels are original dataset class ids (ints). Map to base-relative indices for loss.
+        labels_rel = torch.tensor([base_label_rel[int(l.item())] for l in labels], dtype=torch.long).to(DEVICE)
 
         # Forward / backward with autocast when using AMP
         if scaler is not None:
             with torch.amp.autocast(device_type='cuda'):
-                logits = model(images)
-                loss = criterion(logits, labels)
+                logits = model(images)                           # (B, n_all)
+                logits_base = logits[:, :len(base_classes)]     # only base-class logits
+                loss = criterion(logits_base, labels_rel)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -301,7 +308,8 @@ def train_one_epoch(epoch):
             scaler.update()
         else:
             logits = model(images)
-            loss = criterion(logits, labels)
+            logits_base = logits[:, :len(base_classes)]
+            loss = criterion(logits_base, labels_rel)
 
             optimizer.zero_grad()
             loss.backward()
@@ -328,8 +336,7 @@ def evaluate():
     model.eval()
 
     # Unified class ordering and label map (same as training)
-    label_map = {c: i for i, c in enumerate(all_classes)}
-    label_to_idx = label_map
+    label_to_idx = label_map_all
 
     logit_scale = model.logit_scale.exp()
     tokenized_prompts = model.tokenized_prompts
