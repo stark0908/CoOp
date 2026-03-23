@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import random
 import clip
+from collections import OrderedDict
 from torchvision.datasets import EuroSAT
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
@@ -18,16 +19,28 @@ LR = 0.002          # paper: SGD with lr=0.002
 WARMUP_LR = 1e-5    # paper: warmup lr for first epoch
 N_CTX = 4           # context length
 
-# ── Data ─────────────────────────────────────────────────────────
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+# ── Data (paper: RandomResizedCrop + RandomFlip + CLIP normalize) ─
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+train_transform = transforms.Compose([
+    transforms.RandomResizedCrop(224, scale=(0.08, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
+    transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
+    transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
+])
+
+test_transform = transforms.Compose([
+    transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD),
 ])
 
 
 class EuroSATFewShot(Dataset):
     """Few-shot subset: only `shots` samples per base class."""
-    def __init__(self, root, base_classes, shots=16):
+    def __init__(self, root, base_classes, shots=16, transform=None):
         self.dataset = EuroSAT(root=root, transform=transform)
 
         self.indices = []
@@ -61,98 +74,114 @@ EUROSAT_CLASSES = {i: name.lower().replace("_", " ") for i, name in enumerate(da
 print(f"Base classes ({len(base_classes)}): {[EUROSAT_CLASSES[c] for c in base_classes]}")
 print(f"New  classes ({len(new_classes)}): {[EUROSAT_CLASSES[c] for c in new_classes]}")
 
-# Train loader: few-shot on base classes only
-train_dataset = EuroSATFewShot("./data", base_classes, NUM_SHOTS)
+# Train loader: few-shot on base classes only (with augmentation)
+train_dataset = EuroSATFewShot("./data", base_classes, NUM_SHOTS, transform=train_transform)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 
-# Test loader: all samples (base + new)
-test_dataset = EuroSAT(root="./data", transform=transform)
+# Test loader: all samples (no augmentation)
+test_dataset = EuroSAT(root="./data", transform=test_transform)
 test_loader = DataLoader(test_dataset, batch_size=64)
 
 # ── CLIP ─────────────────────────────────────────────────────────
-clip_model, preprocess = clip.load("ViT-B/16", device=DEVICE)
+print("Loading CLIP model...")
+clip_model, _ = clip.load("ViT-B/16", device=DEVICE)
+print("CLIP model loaded.")
 
 for param in clip_model.parameters():
     param.requires_grad = False
 
-# ── Model ────────────────────────────────────────────────────────
+# ── Custom TextEncoder (matches original repo) ──────────────────
 
-class MetaNet(nn.Module):
-    """Lightweight bottleneck network (paper: 16x reduction)."""
-    def __init__(self, input_dim, reduction=16):
+class TextEncoder(nn.Module):
+    def __init__(self, clip_model):
         super().__init__()
+        self.transformer = clip_model.transformer
+        self.positional_embedding = clip_model.positional_embedding
+        self.ln_final = clip_model.ln_final
+        self.text_projection = clip_model.text_projection
+        self.dtype = clip_model.dtype
 
-        hidden_dim = input_dim // reduction
+    def forward(self, prompts, tokenized_prompts):
+        x = prompts + self.positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_final(x).type(self.dtype)
 
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim)
-        )
+        # Take features from the EOT embedding
+        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
 
-    def forward(self, x):
-        return self.net(x)
+        return x
 
+
+# ── Model ────────────────────────────────────────────────────────
 
 class PromptLearnerCoCoOp(nn.Module):
     def __init__(self, classnames, clip_model, n_ctx=4):
         super().__init__()
 
-        self.classnames = classnames
         self.n_cls = len(classnames)
         self.n_ctx = n_ctx
 
+        dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
+        vis_dim = clip_model.visual.output_dim
 
         # Initialize context from "a photo of a"
         prompt = "a photo of a"
         tokenized = clip.tokenize(prompt).to(DEVICE)
 
         with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized).float()
+            embedding = clip_model.token_embedding(tokenized).type(dtype)
 
         self.ctx = nn.Parameter(embedding[0, 1:1+n_ctx, :])
 
-        # Tokenize class prompts
-        self.tokenized_prompts = torch.cat([
-            clip.tokenize(f"a photo of a {name}") for name in classnames
-        ]).to(DEVICE)
+        # Meta-Net: vis_dim → vis_dim//16 → ctx_dim (matches original repo)
+        self.meta_net = nn.Sequential(OrderedDict([
+            ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
+            ("relu", nn.ReLU(inplace=True)),
+            ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
+        ]))
 
-        self.clip_model = clip_model
+        # Tokenize class prompts (with period, matching original)
+        classnames_clean = [name.replace("_", " ") for name in classnames]
+        prompts_text = [f"a photo of a {name}." for name in classnames_clean]
 
-        # Meta-Net: generates instance-conditional token
-        self.meta_net = MetaNet(ctx_dim)
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts_text]).to(DEVICE)
+
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+
+        # Store prefix (SOS) and suffix (CLASS + . + EOS) as buffers
+        self.register_buffer("token_prefix", embedding[:, :1, :])          # SOS
+        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, ., EOS
+
+        self.tokenized_prompts = tokenized_prompts
+
+    def construct_prompts(self, ctx, prefix, suffix):
+        prompts = torch.cat([prefix, ctx, suffix], dim=1)
+        return prompts
 
     def forward(self, image_features):
         """
         image_features: (B, D)
         Returns prompts: (B, C, L, D)
         """
-        B = image_features.shape[0]
+        prefix = self.token_prefix
+        suffix = self.token_suffix
+        ctx = self.ctx                          # (n_ctx, ctx_dim)
+        bias = self.meta_net(image_features)    # (batch, ctx_dim)
+        bias = bias.unsqueeze(1)                # (batch, 1, ctx_dim)
+        ctx = ctx.unsqueeze(0)                  # (1, n_ctx, ctx_dim)
+        ctx_shifted = ctx + bias                # (batch, n_ctx, ctx_dim)
 
-        # Generate conditional token from image features
-        pi = self.meta_net(image_features)  # (B, D)
-
-        # Expand context for all classes
-        ctx = self.ctx.unsqueeze(0).unsqueeze(0)  # (1, 1, n_ctx, D)
-        ctx = ctx.expand(B, self.n_cls, -1, -1)   # (B, C, n_ctx, D)
-
-        # Add conditional token to context
-        pi = pi.unsqueeze(1).unsqueeze(2)          # (B, 1, 1, D)
-        ctx = ctx + pi                             # (B, C, n_ctx, D)
-
-        # Token embeddings for class prompts
-        token_embeddings = self.clip_model.token_embedding(
-            self.tokenized_prompts
-        )  # (C, L, D)
-
-        prefix = token_embeddings[:, :1, :]
-        suffix = token_embeddings[:, 1+self.n_ctx:, :]
-
-        prefix = prefix.unsqueeze(0).expand(B, -1, -1, -1)
-        suffix = suffix.unsqueeze(0).expand(B, -1, -1, -1)
-
-        prompts = torch.cat([prefix, ctx, suffix], dim=2)
+        # Build per-instance prompts for all classes
+        prompts = []
+        for ctx_shifted_i in ctx_shifted:
+            ctx_i = ctx_shifted_i.unsqueeze(0).expand(self.n_cls, -1, -1)
+            pts_i = self.construct_prompts(ctx_i, prefix, suffix)  # (n_cls, n_tkn, ctx_dim)
+            prompts.append(pts_i)
+        prompts = torch.stack(prompts)  # (B, C, L, D)
 
         return prompts
 
@@ -162,30 +191,32 @@ class CoCoOpModel(nn.Module):
         super().__init__()
 
         self.prompt_learner = PromptLearnerCoCoOp(classnames, clip_model, N_CTX)
-        self.clip_model = clip_model
+        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        self.image_encoder = clip_model.visual
+        self.text_encoder = TextEncoder(clip_model)
+        self.logit_scale = clip_model.logit_scale
+        self.dtype = clip_model.dtype
 
     def forward(self, images):
-        B = images.shape[0]
+        tokenized_prompts = self.tokenized_prompts
+        logit_scale = self.logit_scale.exp()
 
-        # Image features
-        image_features = self.clip_model.encode_image(images)
+        image_features = self.image_encoder(images.type(self.dtype))
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
         # Instance-conditional prompts
         prompts = self.prompt_learner(image_features)  # (B, C, L, D)
 
         # Per-image text encoding (necessary for CoCoOp)
-        logits_all = []
-        for i in range(B):
-            text_features = self.clip_model.encode_text(prompts[i])
+        logits = []
+        for pts_i, imf_i in zip(prompts, image_features):
+            text_features = self.text_encoder(pts_i, tokenized_prompts)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            l_i = logit_scale * imf_i @ text_features.t()
+            logits.append(l_i)
+        logits = torch.stack(logits)  # (B, C)
 
-            logits = image_features[i] @ text_features.T
-            logits_all.append(logits)
-
-        logits_all = torch.stack(logits_all)  # (B, C)
-
-        return logits_all
+        return logits
 
 
 # ── Setup ────────────────────────────────────────────────────────
@@ -207,8 +238,8 @@ criterion = nn.CrossEntropyLoss()
 
 # ── Zero-shot text features for new classes ──────────────────────
 def get_zeroshot_text_features(classnames_list):
-    """Get CLIP zero-shot text features for a list of class names."""
-    prompts = [f"a photo of a {EUROSAT_CLASSES[c]}" for c in classnames_list]
+    """Get CLIP zero-shot text features for a list of class names (with period)."""
+    prompts = [f"a photo of a {EUROSAT_CLASSES[c]}." for c in classnames_list]
     tokens = clip.tokenize(prompts).to(DEVICE)
     with torch.no_grad():
         text_features = clip_model.encode_text(tokens).float()
@@ -248,7 +279,8 @@ def evaluate():
     """
     Evaluate on ALL test data.
     CoCoOp generates instance-conditional prompts, so for base classes
-    we use the learned prompt+meta-net. For new classes we use zero-shot CLIP.
+    we use the learned prompt+meta-net via custom TextEncoder.
+    For new classes we use zero-shot CLIP.
 
     All images classified against all 10 classes.
     Returns (base_acc, new_acc, harmonic_mean)
@@ -261,7 +293,9 @@ def evaluate():
     # Build ordered class list: [base_0..base_4, new_0..new_4]
     all_classes_ordered = base_classes + new_classes
     label_to_idx = {c: i for i, c in enumerate(all_classes_ordered)}
-    n_base = len(base_classes)
+
+    logit_scale = model.logit_scale.exp()
+    tokenized_prompts = model.tokenized_prompts
 
     correct_base = 0
     total_base = 0
@@ -275,22 +309,22 @@ def evaluate():
             B = images.shape[0]
 
             # Get image features
-            image_features = model.clip_model.encode_image(images).float()
+            image_features = model.image_encoder(images.type(model.dtype)).float()
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
-            # Get instance-conditional text features for base classes
+            # Get instance-conditional prompts for base classes
             prompts = model.prompt_learner(image_features)  # (B, n_base, L, D)
 
             for i in range(B):
                 # Base class text features (learned, instance-conditional)
-                base_text_features = model.clip_model.encode_text(prompts[i]).float()
+                base_text_features = model.text_encoder(prompts[i], tokenized_prompts).float()
                 base_text_features = base_text_features / base_text_features.norm(dim=-1, keepdim=True)
 
                 # Combine with new class zero-shot features
                 all_text_features = torch.cat([base_text_features, new_text_features], dim=0)
 
-                # Classify against all classes
-                logits = image_features[i] @ all_text_features.T
+                # Classify against all classes (with logit_scale)
+                logits = logit_scale * image_features[i] @ all_text_features.T
                 pred = logits.argmax().item()
 
                 label = labels[i].item()
@@ -320,7 +354,8 @@ def evaluate():
 def train_and_evaluate():
     print(f"\n{'='*50}")
     print(f"CoCoOp Training — {EPOCHS} epochs, {NUM_SHOTS}-shot")
-    print(f"Base: {base_classes} | New: {new_classes}")
+    print(f"Base: {[EUROSAT_CLASSES[c] for c in base_classes]}")
+    print(f"New:  {[EUROSAT_CLASSES[c] for c in new_classes]}")
     print(f"{'='*50}\n")
 
     for epoch in range(EPOCHS):
