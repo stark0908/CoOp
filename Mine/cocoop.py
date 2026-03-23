@@ -205,7 +205,9 @@ class PromptLearnerCoCoOp(nn.Module):
             prompts.append(pts_i)
         prompts = torch.stack(prompts)  # (B, C, L, D)
 
-        return prompts
+        # Return prompts in CLIP dtype (e.g., float16) for the text encoder,
+        # while keeping learnable parameters in FP32.
+        return prompts.to(self.dtype)
 
 
 class CoCoOpModel(nn.Module):
