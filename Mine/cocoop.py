@@ -146,7 +146,8 @@ class PromptLearnerCoCoOp(nn.Module):
         with torch.no_grad():
             embedding = clip_model.token_embedding(tokenized).type(dtype)
 
-        self.ctx = nn.Parameter(embedding[0, 1:1+n_ctx, :])
+        # Keep learnable context parameters in FP32 to avoid FP16-grad issues with GradScaler
+        self.ctx = nn.Parameter(embedding[0, 1:1+n_ctx, :].to(torch.float32))
 
         # Meta-Net: vis_dim → vis_dim//16 → ctx_dim (matches original repo)
         self.meta_net = nn.Sequential(OrderedDict([
@@ -155,13 +156,10 @@ class PromptLearnerCoCoOp(nn.Module):
             ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
         ]))
 
-        # Ensure meta-net uses the same dtype as CLIP (avoid Half/Float mismatches)
+        # Keep meta-net in FP32 (GradScaler cannot unscale FP16 grads)
+        self.meta_net = self.meta_net.to(torch.float32)
+        self.meta_net_dtype = torch.float32
         self.dtype = dtype
-        try:
-            self.meta_net = self.meta_net.to(dtype)
-        except Exception:
-            # Fallback: leave as-is; forward will cast inputs if necessary
-            pass
 
         # Tokenize class prompts (with period, matching original)
         classnames_clean = [name.replace("_", " ") for name in classnames]
@@ -179,6 +177,9 @@ class PromptLearnerCoCoOp(nn.Module):
         self.tokenized_prompts = tokenized_prompts
 
     def construct_prompts(self, ctx, prefix, suffix):
+        # Ensure prefix/suffix match ctx dtype (ctx is FP32)
+        prefix = prefix.to(ctx.dtype)
+        suffix = suffix.to(ctx.dtype)
         prompts = torch.cat([prefix, ctx, suffix], dim=1)
         return prompts
 
@@ -190,7 +191,8 @@ class PromptLearnerCoCoOp(nn.Module):
         prefix = self.token_prefix
         suffix = self.token_suffix
         ctx = self.ctx                          # (n_ctx, ctx_dim)
-        bias = self.meta_net(image_features)    # (batch, ctx_dim)
+        # meta_net parameters are FP32; ensure inputs are cast to FP32 to avoid FP16-grad issues
+        bias = self.meta_net(image_features.to(self.meta_net_dtype))    # (batch, ctx_dim)
         bias = bias.unsqueeze(1)                # (batch, 1, ctx_dim)
         ctx = ctx.unsqueeze(0)                  # (1, n_ctx, ctx_dim)
         ctx_shifted = ctx + bias                # (batch, n_ctx, ctx_dim)
@@ -290,7 +292,7 @@ def train_one_epoch(epoch):
 
         # Forward / backward with autocast when using AMP
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(device_type='cuda'):
                 logits = model(images)
                 loss = criterion(logits, labels)
 
@@ -349,7 +351,7 @@ def evaluate():
 
             # Get image features (use autocast when AMP is enabled)
             if USE_AMP:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast(device_type='cuda'):
                     image_features = model.image_encoder(images.type(model.dtype)).float()
                     image_features = image_features / image_features.norm(dim=-1, keepdim=True)
                     # Get instance-conditional prompts for base classes
