@@ -100,15 +100,15 @@ base_label_rel = {c: i for i, c in enumerate(base_classes)}
 
 # Train loader: few-shot on base classes only (with augmentation)
 # Batch size = 1 for deterministic per-instance prompts
-num_workers = min(4, (os.cpu_count() or 1))
-pin_memory = True if "cuda" in DEVICE else False
+num_workers = min(8, (os.cpu_count() or 1))
+pin_memory = True
 train_dataset = EuroSATFewShot(DATA_ROOT, base_classes, NUM_SHOTS, transform=train_transform)
 train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True,
                           num_workers=num_workers, pin_memory=pin_memory)
 
 # Test loader: all samples (no augmentation)
 test_dataset = EuroSAT(root=DATA_ROOT, transform=test_transform)
-test_loader = DataLoader(test_dataset, batch_size=1,
+test_loader = DataLoader(test_dataset, batch_size=64,
                          num_workers=num_workers, pin_memory=pin_memory)
 
 print("Data loaders created.", flush=True)
@@ -296,6 +296,24 @@ if wandb is not None:
     except Exception:
         pass
 
+# create fast mapping tensor
+num_total_classes = max(base_label_rel.keys()) + 1
+label_map_tensor = torch.full((num_total_classes,), -1, dtype=torch.long)
+
+for k, v in base_label_rel.items():
+    label_map_tensor[k] = v
+
+label_map_tensor = label_map_tensor.to(DEVICE)
+
+# create mapping for ALL classes (for eval)
+num_total_classes_all = max(label_map_all.keys()) + 1
+label_map_tensor_all = torch.full((num_total_classes_all,), -1, dtype=torch.long)
+
+for k, v in label_map_all.items():
+    label_map_tensor_all[k] = v
+
+label_map_tensor_all = label_map_tensor_all.to(DEVICE)
+
 
 # ── Training + Evaluation Loop ───────────────────────────────────
 def train_one_epoch(epoch):
@@ -308,7 +326,8 @@ def train_one_epoch(epoch):
     for images, labels in pbar:
         images = images.to(DEVICE)
         # labels are original dataset class ids (ints). Map to base-relative indices for loss.
-        labels_rel = torch.tensor([base_label_rel[int(l.item())] for l in labels], dtype=torch.long).to(DEVICE)
+        labels = labels.to(DEVICE)
+        labels_rel = label_map_tensor[labels].to(DEVICE)
 
         # Forward / backward with autocast when using AMP
         if scaler is not None:
@@ -338,6 +357,10 @@ def train_one_epoch(epoch):
     return total_loss / max(n_batches, 1)
 
 
+base_classes_tensor = torch.tensor(base_classes, device=DEVICE)
+new_classes_tensor  = torch.tensor(new_classes, device=DEVICE)
+
+
 def evaluate():
     """
     Evaluate on ALL test data.
@@ -350,12 +373,6 @@ def evaluate():
     """
     model.eval()
 
-    # Unified class ordering and label map (same as training)
-    label_to_idx = label_map_all
-
-    logit_scale = model.logit_scale.exp()
-    tokenized_prompts = model.tokenized_prompts
-
     correct_base = 0
     total_base = 0
     correct_new = 0
@@ -363,35 +380,40 @@ def evaluate():
 
     with torch.no_grad():
         pbar = tqdm(test_loader, desc=f"         [Eval] ", leave=False)
+
         for images, labels in pbar:
             images = images.to(DEVICE)
-            B = images.shape[0]
+            labels = labels.to(DEVICE)
 
-            # Use model to get logits over ALL classes (handles prompts + encoding)
+            # forward
             if USE_AMP:
                 with torch.amp.autocast(device_type='cuda'):
                     logits_batch = model(images)
             else:
                 logits_batch = model(images)
 
-            preds = logits_batch.argmax(dim=1).tolist()
+            preds = logits_batch.argmax(dim=1)
 
-            for i in range(B):
-                pred = preds[i]
-                label = labels[i].item()
-                if label in base_classes:
-                    total_base += 1
-                    if pred == label_to_idx[label]:
-                        correct_base += 1
-                elif label in new_classes:
-                    total_new += 1
-                    if pred == label_to_idx[label]:
-                        correct_new += 1
+            # fast label mapping (NO python loop)
+            label_indices = label_map_tensor_all[labels]
+
+            # masks
+            base_mask = torch.isin(labels, base_classes_tensor)
+            new_mask  = torch.isin(labels, new_classes_tensor)
+
+            # correctness
+            correct = (preds == label_indices)
+
+            # accumulate
+            correct_base += (correct & base_mask).sum().item()
+            total_base   += base_mask.sum().item()
+
+            correct_new  += (correct & new_mask).sum().item()
+            total_new    += new_mask.sum().item()
 
     base_acc = correct_base / max(total_base, 1)
-    new_acc = correct_new / max(total_new, 1)
+    new_acc  = correct_new / max(total_new, 1)
 
-    # Harmonic mean
     if base_acc + new_acc > 0:
         h = 2 * base_acc * new_acc / (base_acc + new_acc)
     else:
