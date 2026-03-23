@@ -82,10 +82,12 @@ train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 test_dataset = EuroSAT(root="./data", transform=test_transform)
 test_loader = DataLoader(test_dataset, batch_size=64)
 
+print("Data loaders created.", flush=True)
+
 # ── CLIP ─────────────────────────────────────────────────────────
-print("Loading CLIP model...")
+print("Loading CLIP model...", flush=True)
 clip_model, _ = clip.load("ViT-B/16", device=DEVICE)
-print("CLIP model loaded.")
+print("CLIP model loaded.", flush=True)
 
 for param in clip_model.parameters():
     param.requires_grad = False
