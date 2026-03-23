@@ -1,0 +1,351 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import random
+import clip
+from torchvision.datasets import EuroSAT
+from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ── Hyperparameters (per paper) ──────────────────────────────────
+NUM_SHOTS = 16
+EPOCHS = 10         # paper: 10 epochs for CoCoOp
+LR = 0.002          # paper: SGD with lr=0.002
+WARMUP_LR = 1e-5    # paper: warmup lr for first epoch
+N_CTX = 4           # context length
+
+# ── Data ─────────────────────────────────────────────────────────
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+])
+
+
+class EuroSATFewShot(Dataset):
+    """Few-shot subset: only `shots` samples per base class."""
+    def __init__(self, root, base_classes, shots=16):
+        self.dataset = EuroSAT(root=root, transform=transform)
+
+        self.indices = []
+        class_counts = {c: 0 for c in base_classes}
+
+        for i, (_, label) in enumerate(self.dataset):
+            if label in base_classes and class_counts[label] < shots:
+                self.indices.append(i)
+                class_counts[label] += 1
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        return self.dataset[self.indices[idx]]
+
+
+# Load full dataset & split classes
+dataset = EuroSAT(root="./data", download=True)
+
+all_classes = list(set([label for _, label in dataset]))
+random.shuffle(all_classes)
+
+split = len(all_classes) // 2
+base_classes = all_classes[:split]
+new_classes = all_classes[split:]
+
+print(f"Base classes ({len(base_classes)}): {base_classes}")
+print(f"New  classes ({len(new_classes)}): {new_classes}")
+
+# Train loader: few-shot on base classes only
+train_dataset = EuroSATFewShot("./data", base_classes, NUM_SHOTS)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+
+# Test loader: all samples (base + new)
+test_dataset = EuroSAT(root="./data", transform=transform)
+test_loader = DataLoader(test_dataset, batch_size=64)
+
+# ── CLIP ─────────────────────────────────────────────────────────
+clip_model, preprocess = clip.load("ViT-B/16", device=DEVICE)
+
+for param in clip_model.parameters():
+    param.requires_grad = False
+
+# ── Model ────────────────────────────────────────────────────────
+
+class MetaNet(nn.Module):
+    """Lightweight bottleneck network (paper: 16x reduction)."""
+    def __init__(self, input_dim, reduction=16):
+        super().__init__()
+
+        hidden_dim = input_dim // reduction
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class PromptLearnerCoCoOp(nn.Module):
+    def __init__(self, classnames, clip_model, n_ctx=4):
+        super().__init__()
+
+        self.classnames = classnames
+        self.n_cls = len(classnames)
+        self.n_ctx = n_ctx
+
+        ctx_dim = clip_model.ln_final.weight.shape[0]
+
+        # Initialize context from "a photo of a"
+        prompt = "a photo of a"
+        tokenized = clip.tokenize(prompt).to(DEVICE)
+
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(tokenized).float()
+
+        self.ctx = nn.Parameter(embedding[0, 1:1+n_ctx, :])
+
+        # Tokenize class prompts
+        self.tokenized_prompts = torch.cat([
+            clip.tokenize(f"a photo of a {name}") for name in classnames
+        ]).to(DEVICE)
+
+        self.clip_model = clip_model
+
+        # Meta-Net: generates instance-conditional token
+        self.meta_net = MetaNet(ctx_dim)
+
+    def forward(self, image_features):
+        """
+        image_features: (B, D)
+        Returns prompts: (B, C, L, D)
+        """
+        B = image_features.shape[0]
+
+        # Generate conditional token from image features
+        pi = self.meta_net(image_features)  # (B, D)
+
+        # Expand context for all classes
+        ctx = self.ctx.unsqueeze(0).unsqueeze(0)  # (1, 1, n_ctx, D)
+        ctx = ctx.expand(B, self.n_cls, -1, -1)   # (B, C, n_ctx, D)
+
+        # Add conditional token to context
+        pi = pi.unsqueeze(1).unsqueeze(2)          # (B, 1, 1, D)
+        ctx = ctx + pi                             # (B, C, n_ctx, D)
+
+        # Token embeddings for class prompts
+        token_embeddings = self.clip_model.token_embedding(
+            self.tokenized_prompts
+        )  # (C, L, D)
+
+        prefix = token_embeddings[:, :1, :]
+        suffix = token_embeddings[:, 1+self.n_ctx:, :]
+
+        prefix = prefix.unsqueeze(0).expand(B, -1, -1, -1)
+        suffix = suffix.unsqueeze(0).expand(B, -1, -1, -1)
+
+        prompts = torch.cat([prefix, ctx, suffix], dim=2)
+
+        return prompts
+
+
+class CoCoOpModel(nn.Module):
+    def __init__(self, classnames, clip_model):
+        super().__init__()
+
+        self.prompt_learner = PromptLearnerCoCoOp(classnames, clip_model, N_CTX)
+        self.clip_model = clip_model
+
+    def forward(self, images):
+        B = images.shape[0]
+
+        # Image features
+        image_features = self.clip_model.encode_image(images)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+        # Instance-conditional prompts
+        prompts = self.prompt_learner(image_features)  # (B, C, L, D)
+
+        # Per-image text encoding (necessary for CoCoOp)
+        logits_all = []
+        for i in range(B):
+            text_features = self.clip_model.encode_text(prompts[i])
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+            logits = image_features[i] @ text_features.T
+            logits_all.append(logits)
+
+        logits_all = torch.stack(logits_all)  # (B, C)
+
+        return logits_all
+
+
+# ── Setup ────────────────────────────────────────────────────────
+print("Setting up CoCoOp model (base classes only)")
+classnames = [str(c) for c in base_classes]
+
+model = CoCoOpModel(classnames, clip_model).to(DEVICE)
+
+optimizer = torch.optim.SGD(
+    model.prompt_learner.parameters(),
+    lr=LR
+)
+
+# Cosine annealing scheduler
+scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+criterion = nn.CrossEntropyLoss()
+
+
+# ── Zero-shot text features for new classes ──────────────────────
+def get_zeroshot_text_features(classnames_list):
+    """Get CLIP zero-shot text features for a list of class names."""
+    prompts = [f"a photo of a {str(c)}" for c in classnames_list]
+    tokens = clip.tokenize(prompts).to(DEVICE)
+    with torch.no_grad():
+        text_features = clip_model.encode_text(tokens).float()
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+    return text_features
+
+
+# ── Training + Evaluation Loop ───────────────────────────────────
+def train_one_epoch():
+    """Train on base classes for one epoch. Returns average loss."""
+    model.train()
+    total_loss = 0
+    n_batches = 0
+
+    for images, labels in train_loader:
+        images = images.to(DEVICE)
+        # Map labels → base class indices (0..4)
+        labels = torch.tensor([base_classes.index(l) for l in labels]).to(DEVICE)
+
+        logits = model(images)
+        loss = criterion(logits, labels)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        n_batches += 1
+
+    return total_loss / max(n_batches, 1)
+
+
+def evaluate():
+    """
+    Evaluate on ALL test data.
+    CoCoOp generates instance-conditional prompts, so for base classes
+    we use the learned prompt+meta-net. For new classes we use zero-shot CLIP.
+
+    All images classified against all 10 classes.
+    Returns (base_acc, new_acc, harmonic_mean)
+    """
+    model.eval()
+
+    # Zero-shot text features for new classes
+    new_text_features = get_zeroshot_text_features(new_classes)
+
+    # Build ordered class list: [base_0..base_4, new_0..new_4]
+    all_classes_ordered = base_classes + new_classes
+    label_to_idx = {c: i for i, c in enumerate(all_classes_ordered)}
+    n_base = len(base_classes)
+
+    correct_base = 0
+    total_base = 0
+    correct_new = 0
+    total_new = 0
+
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = images.to(DEVICE)
+            B = images.shape[0]
+
+            # Get image features
+            image_features = model.clip_model.encode_image(images).float()
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+            # Get instance-conditional text features for base classes
+            prompts = model.prompt_learner(image_features)  # (B, n_base, L, D)
+
+            for i in range(B):
+                # Base class text features (learned, instance-conditional)
+                base_text_features = model.clip_model.encode_text(prompts[i]).float()
+                base_text_features = base_text_features / base_text_features.norm(dim=-1, keepdim=True)
+
+                # Combine with new class zero-shot features
+                all_text_features = torch.cat([base_text_features, new_text_features], dim=0)
+
+                # Classify against all classes
+                logits = image_features[i] @ all_text_features.T
+                pred = logits.argmax().item()
+
+                label = labels[i].item()
+
+                if label in base_classes:
+                    total_base += 1
+                    if pred == label_to_idx[label]:
+                        correct_base += 1
+
+                elif label in new_classes:
+                    total_new += 1
+                    if pred == label_to_idx[label]:
+                        correct_new += 1
+
+    base_acc = correct_base / max(total_base, 1)
+    new_acc = correct_new / max(total_new, 1)
+
+    # Harmonic mean
+    if base_acc + new_acc > 0:
+        h = 2 * base_acc * new_acc / (base_acc + new_acc)
+    else:
+        h = 0.0
+
+    return base_acc, new_acc, h
+
+
+def train_and_evaluate():
+    print(f"\n{'='*50}")
+    print(f"CoCoOp Training — {EPOCHS} epochs, {NUM_SHOTS}-shot")
+    print(f"Base: {base_classes} | New: {new_classes}")
+    print(f"{'='*50}\n")
+
+    for epoch in range(EPOCHS):
+        # Warmup: fix lr at 1e-5 for first epoch
+        if epoch == 0:
+            for pg in optimizer.param_groups:
+                pg['lr'] = WARMUP_LR
+
+        # Train
+        avg_loss = train_one_epoch()
+
+        # Step scheduler (after warmup epoch)
+        if epoch == 0:
+            for pg in optimizer.param_groups:
+                pg['lr'] = LR
+        else:
+            scheduler.step()
+
+        current_lr = optimizer.param_groups[0]['lr']
+
+        # Evaluate
+        base_acc, new_acc, h = evaluate()
+
+        # Log
+        print(f"{'='*15} Epoch {epoch+1:3d}/{EPOCHS} {'='*15}")
+        print(f"  Train Loss : {avg_loss:.4f}")
+        print(f"  LR         : {current_lr:.6f}")
+        print(f"  Base Acc   : {base_acc*100:.2f}%")
+        print(f"  New Acc    : {new_acc*100:.2f}%")
+        print(f"  H          : {h*100:.2f}%")
+        print(f"{'='*42}")
+
+
+# ── Run ──────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    train_and_evaluate()
