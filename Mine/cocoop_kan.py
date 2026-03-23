@@ -10,8 +10,14 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import os
+import time
 
-DEVICE = os.environ.get("CUDA_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+try:
+    import wandb
+except Exception:
+    wandb = None
+
+DEVICE = os.environ.get("CUDA_DEVICE", "cuda:2" if torch.cuda.is_available() else "cpu")
 
 # Path to Eurosat data (override with env var `EUROSAT_ROOT`).
 # Default to torchvision-style local folder and allow automatic download.
@@ -52,7 +58,7 @@ class EuroSATFewShot(Dataset):
         self.indices = []
         class_counts = {c: 0 for c in base_classes}
 
-        # ⚡ FAST: no image loading
+        
         for i, label in enumerate(self.dataset.targets):
             if label in base_classes and class_counts[label] < shots:
                 self.indices.append(i)
@@ -88,10 +94,13 @@ print(f"New  classes ({len(new_classes)}): {[EUROSAT_CLASSES[c] for c in new_cla
 all_classes = base_classes + new_classes
 
 # Global label maps (computed once)
+# label_map_all: dataset class_id -> position in model outputs (all_classes ordering)
 label_map_all = {c: i for i, c in enumerate(all_classes)}
+# base_label_rel: dataset class_id (only for base classes) -> 0..(n_base-1)
 base_label_rel = {c: i for i, c in enumerate(base_classes)}
 
 # Train loader: few-shot on base classes only (with augmentation)
+# Batch size = 1 for deterministic per-instance prompts
 num_workers = min(4, (os.cpu_count() or 1))
 pin_memory = True if "cuda" in DEVICE else False
 train_dataset = EuroSATFewShot(DATA_ROOT, base_classes, NUM_SHOTS, transform=train_transform)
@@ -136,23 +145,113 @@ class TextEncoder(nn.Module):
 
         return x
 
-class KanLayer(nn.Module):
-    """Efficient 'Kan' bottleneck with gating."""
-    def __init__(self, in_dim, out_dim, hidden=None):
+class SimpleKANLayer(nn.Module):
+    def __init__(self, in_features, out_features, hidden_dim=16):
         super().__init__()
-        if hidden is None:
-            hidden = max(in_dim // 16, 4)
-        self.fc1 = nn.Linear(in_dim, hidden)
-        self.fc2 = nn.Linear(hidden, out_dim)
-        self.gate = nn.Linear(in_dim, out_dim)
+        
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # φ_ij functions: one small MLP per connection
+        self.phi = nn.ModuleList([
+            nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(1, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, 1)
+                )
+                for _ in range(out_features)
+            ])
+            for _ in range(in_features)
+        ])
 
     def forward(self, x):
-        # x: (B, in_dim)
-        h = F.relu(self.fc1(x))
-        out = self.fc2(h)                # (B, out_dim)
-        g = torch.sigmoid(self.gate(x))  # (B, out_dim)
-        return out * g
+        # x: (batch_size, in_features)
+        outputs = []
 
+        for j in range(self.out_features):
+            y_j = 0
+
+            for i in range(self.in_features):
+                x_i = x[:, i].unsqueeze(1)     # (B, 1)
+                y_j = y_j + self.phi[i][j](x_i)
+
+            outputs.append(y_j)
+
+        return torch.cat(outputs, dim=1)  # (B, out_features)
+
+class MLPBlock(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        hidden = max(in_dim // 16, 4)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, out_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class MetaNet_KAN(nn.Module):
+    def __init__(self, vis_dim, ctx_dim):
+        super().__init__()
+        bottleneck = max(vis_dim // 16, 4)
+
+        self.reduce = nn.Linear(vis_dim, bottleneck)
+        self.kan = SimpleKANLayer(bottleneck, ctx_dim)
+
+    def forward(self, x):
+        x = self.reduce(x)
+        return self.kan(x)
+
+class MetaNet_Concat(nn.Module):
+    def __init__(self, vis_dim, ctx_dim):
+        super().__init__()
+        bottleneck = max(vis_dim // 16, 4)
+
+        # Two parallel paths
+        self.reduce = nn.Linear(vis_dim, bottleneck)
+        self.ann = MLPBlock(bottleneck, bottleneck)
+        self.kan = SimpleKANLayer(bottleneck, bottleneck)
+
+        # Fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(bottleneck * 2, ctx_dim)
+        )
+
+    def forward(self, x):
+        x = self.reduce(x)
+
+        ann_out = self.ann(x)
+        kan_out = self.kan(x)
+
+        combined = torch.cat([ann_out, kan_out], dim=1)
+        return self.fusion(combined)
+
+class MetaNet_Gated(nn.Module):
+    def __init__(self, vis_dim, ctx_dim):
+        super().__init__()
+        bottleneck = max(vis_dim // 16, 4)
+
+        self.reduce = nn.Linear(vis_dim, bottleneck)
+
+        self.ann = MLPBlock(bottleneck, ctx_dim)
+        self.kan = SimpleKANLayer(bottleneck, ctx_dim)
+
+        # Gate decides importance of ANN vs KAN
+        self.gate = nn.Linear(bottleneck, ctx_dim)
+
+    def forward(self, x):
+        x = self.reduce(x)
+
+        ann_out = self.ann(x)
+        kan_out = self.kan(x)
+
+        g = torch.sigmoid(self.gate(x))  # (B, ctx_dim)
+
+        # convex combination
+        return g * ann_out + (1 - g) * kan_out
 
 # ── Model ────────────────────────────────────────────────────────
 
@@ -177,11 +276,8 @@ class PromptLearnerCoCoOp(nn.Module):
         # Keep learnable context parameters in FP32 to avoid FP16-grad issues with GradScaler
         self.ctx = nn.Parameter(embedding[0, 1:1+n_ctx, :].to(torch.float32))
 
-        # Meta-Net: two-stage KanLayer (vis_dim -> vis_dim//16 -> ctx_dim)
-        self.meta_net = nn.Sequential(
-            KanLayer(vis_dim, vis_dim // 16),
-            KanLayer(vis_dim // 16, ctx_dim)
-        )
+        # Meta-Net: vis_dim → vis_dim//16 → ctx_dim (matches original repo)
+        self.meta_net = MetaNet_KAN(vis_dim, ctx_dim)
 
         # Keep meta-net in FP32 (GradScaler cannot unscale FP16 grads)
         self.meta_net = self.meta_net.to(torch.float32)
@@ -273,6 +369,7 @@ class CoCoOpModel(nn.Module):
 # ── Setup ────────────────────────────────────────────────────────
 print("Setting up CoCoOp model (all classes)")
 classnames = [EUROSAT_CLASSES[c] for c in all_classes]
+
 model = CoCoOpModel(classnames, clip_model).to(DEVICE)
 
 optimizer = torch.optim.SGD(
@@ -293,16 +390,15 @@ if USE_AMP:
 else:
     scaler = None
 
-
-# ── Zero-shot text features for new classes ──────────────────────
-def get_zeroshot_text_features(classnames_list):
-    """Get CLIP zero-shot text features for a list of class names (with period)."""
-    prompts = [f"a photo of a {EUROSAT_CLASSES[c]}." for c in classnames_list]
-    tokens = clip.tokenize(prompts).to(DEVICE)
-    with torch.no_grad():
-        text_features = clip_model.encode_text(tokens).float()
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-    return text_features
+# Initialize wandb (optional)
+if wandb is not None:
+    wandb.init(project=os.environ.get("WANDB_PROJECT", "cocoop_kan"),
+               config={"epochs": EPOCHS, "lr": LR, "warmup_lr": WARMUP_LR,
+                       "n_ctx": N_CTX, "num_shots": NUM_SHOTS})
+    try:
+        wandb.watch(model, log="all", log_freq=100)
+    except Exception:
+        pass
 
 
 # ── Training + Evaluation Loop ───────────────────────────────────
@@ -315,13 +411,14 @@ def train_one_epoch(epoch):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Train]", leave=False)
     for images, labels in pbar:
         images = images.to(DEVICE)
+        # labels are original dataset class ids (ints). Map to base-relative indices for loss.
         labels_rel = torch.tensor([base_label_rel[int(l.item())] for l in labels], dtype=torch.long).to(DEVICE)
 
         # Forward / backward with autocast when using AMP
         if scaler is not None:
             with torch.amp.autocast(device_type='cuda'):
-                logits = model(images)
-                logits_base = logits[:, :len(base_classes)]
+                logits = model(images)                           # (B, n_all)
+                logits_base = logits[:, :len(base_classes)]     # only base-class logits
                 loss = criterion(logits_base, labels_rel)
 
             optimizer.zero_grad()
@@ -360,6 +457,9 @@ def evaluate():
     # Unified class ordering and label map (same as training)
     label_to_idx = label_map_all
 
+    logit_scale = model.logit_scale.exp()
+    tokenized_prompts = model.tokenized_prompts
+
     correct_base = 0
     total_base = 0
     correct_new = 0
@@ -380,7 +480,6 @@ def evaluate():
 
             preds = logits_batch.argmax(dim=1).tolist()
 
-            # Accumulate metrics (small Python loop over batch is fine)
             for i in range(B):
                 pred = preds[i]
                 label = labels[i].item()
@@ -433,7 +532,7 @@ def train_and_evaluate():
         # Evaluate
         base_acc, new_acc, h = evaluate()
 
-        # Log
+        # Log to stdout
         print(f"{'='*15} Epoch {epoch+1:3d}/{EPOCHS} {'='*15}")
         print(f"  Train Loss : {avg_loss:.4f}")
         print(f"  LR         : {current_lr:.6f}")
@@ -441,6 +540,25 @@ def train_and_evaluate():
         print(f"  New Acc    : {new_acc*100:.2f}%")
         print(f"  H          : {h*100:.2f}%")
         print(f"{'='*42}")
+
+        # Log to wandb if available
+        if wandb is not None:
+            wandb.log({
+                "train/loss": avg_loss,
+                "train/lr": current_lr,
+                "eval/base_acc": base_acc,
+                "eval/new_acc": new_acc,
+                "eval/h": h,
+                "epoch": epoch + 1,
+                "timestamp": time.time()
+            }, step=epoch + 1)
+
+    # Finish wandb run
+    if wandb is not None:
+        try:
+            wandb.finish()
+        except Exception:
+            pass
 
 
 # ── Run ──────────────────────────────────────────────────────────

@@ -11,12 +11,13 @@ from tqdm import tqdm
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import os
 import time
+
 try:
     import wandb
 except Exception:
     wandb = None
 
-DEVICE = os.environ.get("CUDA_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = os.environ.get("CUDA_DEVICE", "cuda:2" if torch.cuda.is_available() else "cpu")
 
 # Path to Eurosat data (override with env var `EUROSAT_ROOT`).
 # Default to torchvision-style local folder and allow automatic download.
@@ -57,7 +58,7 @@ class EuroSATFewShot(Dataset):
         self.indices = []
         class_counts = {c: 0 for c in base_classes}
 
-        # ⚡ FAST: no image loading
+        
         for i, label in enumerate(self.dataset.targets):
             if label in base_classes and class_counts[label] < shots:
                 self.indices.append(i)
@@ -144,6 +145,113 @@ class TextEncoder(nn.Module):
 
         return x
 
+class SimpleKANLayer(nn.Module):
+    def __init__(self, in_features, out_features, hidden_dim=16):
+        super().__init__()
+        
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # φ_ij functions: one small MLP per connection
+        self.phi = nn.ModuleList([
+            nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(1, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, 1)
+                )
+                for _ in range(out_features)
+            ])
+            for _ in range(in_features)
+        ])
+
+    def forward(self, x):
+        # x: (batch_size, in_features)
+        outputs = []
+
+        for j in range(self.out_features):
+            y_j = 0
+
+            for i in range(self.in_features):
+                x_i = x[:, i].unsqueeze(1)     # (B, 1)
+                y_j = y_j + self.phi[i][j](x_i)
+
+            outputs.append(y_j)
+
+        return torch.cat(outputs, dim=1)  # (B, out_features)
+
+class MLPBlock(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        hidden = max(in_dim // 16, 4)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, out_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class MetaNet_KAN(nn.Module):
+    def __init__(self, vis_dim, ctx_dim):
+        super().__init__()
+        bottleneck = max(vis_dim // 16, 4)
+
+        self.reduce = nn.Linear(vis_dim, bottleneck)
+        self.kan = SimpleKANLayer(bottleneck, ctx_dim)
+
+    def forward(self, x):
+        x = self.reduce(x)
+        return self.kan(x)
+
+class MetaNet_Concat(nn.Module):
+    def __init__(self, vis_dim, ctx_dim):
+        super().__init__()
+        bottleneck = max(vis_dim // 16, 4)
+
+        # Two parallel paths
+        self.reduce = nn.Linear(vis_dim, bottleneck)
+        self.ann = MLPBlock(bottleneck, bottleneck)
+        self.kan = SimpleKANLayer(bottleneck, bottleneck)
+
+        # Fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(bottleneck * 2, ctx_dim)
+        )
+
+    def forward(self, x):
+        x = self.reduce(x)
+
+        ann_out = self.ann(x)
+        kan_out = self.kan(x)
+
+        combined = torch.cat([ann_out, kan_out], dim=1)
+        return self.fusion(combined)
+
+class MetaNet_Gated(nn.Module):
+    def __init__(self, vis_dim, ctx_dim):
+        super().__init__()
+        bottleneck = max(vis_dim // 16, 4)
+
+        self.reduce = nn.Linear(vis_dim, bottleneck)
+
+        self.ann = MLPBlock(bottleneck, ctx_dim)
+        self.kan = SimpleKANLayer(bottleneck, ctx_dim)
+
+        # Gate decides importance of ANN vs KAN
+        self.gate = nn.Linear(bottleneck, ctx_dim)
+
+    def forward(self, x):
+        x = self.reduce(x)
+
+        ann_out = self.ann(x)
+        kan_out = self.kan(x)
+
+        g = torch.sigmoid(self.gate(x))  # (B, ctx_dim)
+
+        # convex combination
+        return g * ann_out + (1 - g) * kan_out
 
 # ── Model ────────────────────────────────────────────────────────
 
@@ -169,11 +277,7 @@ class PromptLearnerCoCoOp(nn.Module):
         self.ctx = nn.Parameter(embedding[0, 1:1+n_ctx, :].to(torch.float32))
 
         # Meta-Net: vis_dim → vis_dim//16 → ctx_dim (matches original repo)
-        self.meta_net = nn.Sequential(OrderedDict([
-            ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
-            ("relu", nn.ReLU(inplace=True)),
-            ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
-        ]))
+        self.meta_net = MetaNet_Concat(vis_dim, ctx_dim)
 
         # Keep meta-net in FP32 (GradScaler cannot unscale FP16 grads)
         self.meta_net = self.meta_net.to(torch.float32)
@@ -288,7 +392,7 @@ else:
 
 # Initialize wandb (optional)
 if wandb is not None:
-    wandb.init(project=os.environ.get("WANDB_PROJECT", "cocoop"),
+    wandb.init(project=os.environ.get("WANDB_PROJECT", "cocoop_kan_CONCAT"),
                config={"epochs": EPOCHS, "lr": LR, "warmup_lr": WARMUP_LR,
                        "n_ctx": N_CTX, "num_shots": NUM_SHOTS})
     try:
