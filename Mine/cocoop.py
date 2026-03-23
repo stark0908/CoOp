@@ -9,8 +9,12 @@ from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from torch.optim.lr_scheduler import CosineAnnealingLR
+import os
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
+
+# Path to Eurosat data (override with env var `EUROSAT_ROOT`)
+DATA_ROOT = os.environ.get("EUROSAT_ROOT", "/home/23dcs505/data/eurosat")
 
 # ── Hyperparameters (per paper) ──────────────────────────────────
 NUM_SHOTS = 16
@@ -41,12 +45,14 @@ test_transform = transforms.Compose([
 class EuroSATFewShot(Dataset):
     """Few-shot subset: only `shots` samples per base class."""
     def __init__(self, root, base_classes, shots=16, transform=None):
-        self.dataset = EuroSAT(root=root, transform=transform)
+        self.dataset = EuroSAT(root=root, transform=None)
+        self.transform = transform
 
         self.indices = []
         class_counts = {c: 0 for c in base_classes}
 
-        for i, (_, label) in enumerate(self.dataset):
+        # ⚡ FAST: no image loading
+        for i, label in enumerate(self.dataset.targets):
             if label in base_classes and class_counts[label] < shots:
                 self.indices.append(i)
                 class_counts[label] += 1
@@ -55,11 +61,14 @@ class EuroSATFewShot(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        return self.dataset[self.indices[idx]]
+        img, label = self.dataset[self.indices[idx]]
+        if self.transform:
+            img = self.transform(img)
+        return img, label
 
 
 # Load full dataset & split classes
-dataset = EuroSAT(root="./data", download=True)
+dataset = EuroSAT(root=DATA_ROOT, download=False)
 
 all_classes = list(set([label for _, label in dataset]))
 random.shuffle(all_classes)
@@ -75,11 +84,11 @@ print(f"Base classes ({len(base_classes)}): {[EUROSAT_CLASSES[c] for c in base_c
 print(f"New  classes ({len(new_classes)}): {[EUROSAT_CLASSES[c] for c in new_classes]}")
 
 # Train loader: few-shot on base classes only (with augmentation)
-train_dataset = EuroSATFewShot("./data", base_classes, NUM_SHOTS, transform=train_transform)
+train_dataset = EuroSATFewShot(DATA_ROOT, base_classes, NUM_SHOTS, transform=train_transform)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 
 # Test loader: all samples (no augmentation)
-test_dataset = EuroSAT(root="./data", transform=test_transform)
+test_dataset = EuroSAT(root=DATA_ROOT, transform=test_transform)
 test_loader = DataLoader(test_dataset, batch_size=64)
 
 print("Data loaders created.", flush=True)
