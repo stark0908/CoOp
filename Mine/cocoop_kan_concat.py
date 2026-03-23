@@ -17,7 +17,7 @@ try:
 except Exception:
     wandb = None
 
-DEVICE = os.environ.get("CUDA_DEVICE", "cuda:2" if torch.cuda.is_available() else "cpu")
+DEVICE = os.environ.get("CUDA_DEVICE", "cuda:6" if torch.cuda.is_available() else "cpu")
 
 # Path to Eurosat data (override with env var `EUROSAT_ROOT`).
 # Default to torchvision-style local folder and allow automatic download.
