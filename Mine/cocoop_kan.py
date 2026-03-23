@@ -156,12 +156,11 @@ class PromptLearnerCoCoOp(nn.Module):
         # Keep learnable context parameters in FP32 to avoid FP16-grad issues with GradScaler
         self.ctx = nn.Parameter(embedding[0, 1:1+n_ctx, :].to(torch.float32))
 
-        # Meta-Net: vis_dim → vis_dim//16 → ctx_dim (matches original repo)
-        self.meta_net = nn.Sequential(OrderedDict([
-            ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
-            ("relu", nn.ReLU(inplace=True)),
-            ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
-        ]))
+        # Meta-Net: two-stage KanLayer (vis_dim -> vis_dim//16 -> ctx_dim)
+        self.meta_net = nn.Sequential(
+            KanLayer(vis_dim, vis_dim // 16),
+            KanLayer(vis_dim // 16, ctx_dim)
+        )
 
         # Keep meta-net in FP32 (GradScaler cannot unscale FP16 grads)
         self.meta_net = self.meta_net.to(torch.float32)
@@ -253,7 +252,6 @@ class CoCoOpModel(nn.Module):
 # ── Setup ────────────────────────────────────────────────────────
 print("Setting up CoCoOp model (all classes)")
 classnames = [EUROSAT_CLASSES[c] for c in all_classes]
-
 model = CoCoOpModel(classnames, clip_model).to(DEVICE)
 
 optimizer = torch.optim.SGD(
@@ -273,6 +271,17 @@ if USE_AMP:
     scaler = GradScaler()
 else:
     scaler = None
+
+
+# ── Zero-shot text features for new classes ──────────────────────
+def get_zeroshot_text_features(classnames_list):
+    """Get CLIP zero-shot text features for a list of class names (with period)."""
+    prompts = [f"a photo of a {EUROSAT_CLASSES[c]}." for c in classnames_list]
+    tokens = clip.tokenize(prompts).to(DEVICE)
+    with torch.no_grad():
+        text_features = clip_model.encode_text(tokens).float()
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+    return text_features
 
 
 # ── Training + Evaluation Loop ───────────────────────────────────
@@ -330,9 +339,6 @@ def evaluate():
     # Unified class ordering and label map (same as training)
     label_map = {c: i for i, c in enumerate(all_classes)}
     label_to_idx = label_map
-
-    logit_scale = model.logit_scale.exp()
-    tokenized_prompts = model.tokenized_prompts
 
     correct_base = 0
     total_base = 0
