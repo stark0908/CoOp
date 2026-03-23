@@ -6,6 +6,7 @@ import clip
 from torchvision.datasets import EuroSAT
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -54,8 +55,11 @@ split = len(all_classes) // 2
 base_classes = all_classes[:split]
 new_classes = all_classes[split:]
 
-print(f"Base classes ({len(base_classes)}): {base_classes}")
-print(f"New  classes ({len(new_classes)}): {new_classes}")
+# Build class name mapping from dataset folder names
+EUROSAT_CLASSES = {i: name.lower().replace("_", " ") for i, name in enumerate(dataset.classes)}
+
+print(f"Base classes ({len(base_classes)}): {[EUROSAT_CLASSES[c] for c in base_classes]}")
+print(f"New  classes ({len(new_classes)}): {[EUROSAT_CLASSES[c] for c in new_classes]}")
 
 # Train loader: few-shot on base classes only
 train_dataset = EuroSATFewShot("./data", base_classes, NUM_SHOTS)
@@ -186,7 +190,7 @@ class CoCoOpModel(nn.Module):
 
 # ── Setup ────────────────────────────────────────────────────────
 print("Setting up CoCoOp model (base classes only)")
-classnames = [str(c) for c in base_classes]
+classnames = [EUROSAT_CLASSES[c] for c in base_classes]
 
 model = CoCoOpModel(classnames, clip_model).to(DEVICE)
 
@@ -204,7 +208,7 @@ criterion = nn.CrossEntropyLoss()
 # ── Zero-shot text features for new classes ──────────────────────
 def get_zeroshot_text_features(classnames_list):
     """Get CLIP zero-shot text features for a list of class names."""
-    prompts = [f"a photo of a {str(c)}" for c in classnames_list]
+    prompts = [f"a photo of a {EUROSAT_CLASSES[c]}" for c in classnames_list]
     tokens = clip.tokenize(prompts).to(DEVICE)
     with torch.no_grad():
         text_features = clip_model.encode_text(tokens).float()
@@ -213,13 +217,14 @@ def get_zeroshot_text_features(classnames_list):
 
 
 # ── Training + Evaluation Loop ───────────────────────────────────
-def train_one_epoch():
+def train_one_epoch(epoch):
     """Train on base classes for one epoch. Returns average loss."""
     model.train()
     total_loss = 0
     n_batches = 0
 
-    for images, labels in train_loader:
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Train]", leave=False)
+    for images, labels in pbar:
         images = images.to(DEVICE)
         # Map labels → base class indices (0..4)
         labels = torch.tensor([base_classes.index(l) for l in labels]).to(DEVICE)
@@ -233,7 +238,9 @@ def train_one_epoch():
 
         total_loss += loss.item()
         n_batches += 1
+        pbar.set_postfix(loss=f"{total_loss/n_batches:.4f}")
 
+    pbar.close()
     return total_loss / max(n_batches, 1)
 
 
@@ -262,7 +269,8 @@ def evaluate():
     total_new = 0
 
     with torch.no_grad():
-        for images, labels in test_loader:
+        pbar = tqdm(test_loader, desc=f"         [Eval] ", leave=False)
+        for images, labels in pbar:
             images = images.to(DEVICE)
             B = images.shape[0]
 
@@ -322,7 +330,7 @@ def train_and_evaluate():
                 pg['lr'] = WARMUP_LR
 
         # Train
-        avg_loss = train_one_epoch()
+        avg_loss = train_one_epoch(epoch)
 
         # Step scheduler (after warmup epoch)
         if epoch == 0:
