@@ -11,7 +11,7 @@ from tqdm import tqdm
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import os
 
-DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
+DEVICE = os.environ.get("CUDA_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
 # Path to Eurosat data (override with env var `EUROSAT_ROOT`).
 # Default to torchvision-style local folder and allow automatic download.
@@ -85,12 +85,16 @@ print(f"Base classes ({len(base_classes)}): {[EUROSAT_CLASSES[c] for c in base_c
 print(f"New  classes ({len(new_classes)}): {[EUROSAT_CLASSES[c] for c in new_classes]}")
 
 # Train loader: few-shot on base classes only (with augmentation)
+num_workers = min(4, (os.cpu_count() or 1))
+pin_memory = True if "cuda" in DEVICE else False
 train_dataset = EuroSATFewShot(DATA_ROOT, base_classes, NUM_SHOTS, transform=train_transform)
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,
+                          num_workers=num_workers, pin_memory=pin_memory)
 
 # Test loader: all samples (no augmentation)
 test_dataset = EuroSAT(root=DATA_ROOT, transform=test_transform)
-test_loader = DataLoader(test_dataset, batch_size=64)
+test_loader = DataLoader(test_dataset, batch_size=64,
+                         num_workers=num_workers, pin_memory=pin_memory)
 
 print("Data loaders created.", flush=True)
 
@@ -178,6 +182,7 @@ class PromptLearnerCoCoOp(nn.Module):
 
     def construct_prompts(self, ctx, prefix, suffix):
         # Ensure prefix/suffix match ctx dtype (ctx is FP32)
+        # kept for compatibility; not used by the vectorized forward
         prefix = prefix.to(ctx.dtype)
         suffix = suffix.to(ctx.dtype)
         prompts = torch.cat([prefix, ctx, suffix], dim=1)
@@ -188,25 +193,22 @@ class PromptLearnerCoCoOp(nn.Module):
         image_features: (B, D)
         Returns prompts: (B, C, L, D)
         """
-        prefix = self.token_prefix
-        suffix = self.token_suffix
-        ctx = self.ctx                          # (n_ctx, ctx_dim)
+        prefix = self.token_prefix                          # (C, 1, D)
+        suffix = self.token_suffix                          # (C, S, D)
+        ctx = self.ctx                                      # (n_ctx, D)
         # meta_net parameters are FP32; ensure inputs are cast to FP32 to avoid FP16-grad issues
-        bias = self.meta_net(image_features.to(self.meta_net_dtype))    # (batch, ctx_dim)
-        bias = bias.unsqueeze(1)                # (batch, 1, ctx_dim)
-        ctx = ctx.unsqueeze(0)                  # (1, n_ctx, ctx_dim)
-        ctx_shifted = ctx + bias                # (batch, n_ctx, ctx_dim)
+        bias = self.meta_net(image_features.to(self.meta_net_dtype))    # (B, ctx_dim)
+        bias = bias.unsqueeze(1)                            # (B, 1, ctx_dim)
+        ctx = ctx.unsqueeze(0)                              # (1, n_ctx, ctx_dim)
+        ctx_shifted = ctx + bias                            # (B, n_ctx, ctx_dim)
 
-        # Build per-instance prompts for all classes
-        prompts = []
-        for ctx_shifted_i in ctx_shifted:
-            ctx_i = ctx_shifted_i.unsqueeze(0).expand(self.n_cls, -1, -1)
-            pts_i = self.construct_prompts(ctx_i, prefix, suffix)  # (n_cls, n_tkn, ctx_dim)
-            prompts.append(pts_i)
-        prompts = torch.stack(prompts)  # (B, C, L, D)
+        # Vectorized expansion across classes:
+        B = ctx_shifted.shape[0]
+        prefix_exp = prefix.unsqueeze(0).expand(B, -1, -1, -1).to(ctx_shifted.dtype)   # (B, C, 1, D)
+        ctx_exp = ctx_shifted.unsqueeze(1).expand(-1, self.n_cls, -1, -1)             # (B, C, n_ctx, D)
+        suffix_exp = suffix.unsqueeze(0).expand(B, -1, -1, -1).to(ctx_shifted.dtype)  # (B, C, S, D)
 
-        # Return prompts in CLIP dtype (e.g., float16) for the text encoder,
-        # while keeping learnable parameters in FP32.
+        prompts = torch.cat([prefix_exp, ctx_exp, suffix_exp], dim=2)  # (B, C, L, D)
         return prompts.to(self.dtype)
 
 
@@ -226,20 +228,22 @@ class CoCoOpModel(nn.Module):
         logit_scale = self.logit_scale.exp()
 
         image_features = self.image_encoder(images.type(self.dtype))
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)   # (B, D)
 
-        # Instance-conditional prompts
-        prompts = self.prompt_learner(image_features)  # (B, C, L, D)
+        # Instance-conditional prompts (B, C, L, D)
+        prompts = self.prompt_learner(image_features)
 
-        # Per-image text encoding (necessary for CoCoOp)
-        logits = []
-        for pts_i, imf_i in zip(prompts, image_features):
-            text_features = self.text_encoder(pts_i, tokenized_prompts)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            l_i = logit_scale * imf_i @ text_features.t()
-            logits.append(l_i)
-        logits = torch.stack(logits)  # (B, C)
+        B, C, L, D = prompts.shape
 
+        # Flatten prompts and repeat tokenized_prompts for batch to encode in one call
+        prompts_flat = prompts.view(B * C, L, D)
+        tokens_expanded = tokenized_prompts.unsqueeze(0).expand(B, -1, -1).reshape(B * C, L).to(prompts_flat.device)
+        text_features_flat = self.text_encoder(prompts_flat, tokens_expanded)  # (B*C, D)
+        text_features = text_features_flat.view(B, C, -1)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        # Batch matrix multiply: (B,1,D) @ (B,D,C) -> (B,1,C) -> squeeze -> (B,C)
+        logits = logit_scale * (image_features.unsqueeze(1) @ text_features.transpose(2, 1)).squeeze(1)
         return logits
 
 
@@ -364,25 +368,30 @@ def evaluate():
                 # Get instance-conditional prompts for base classes
                 prompts = model.prompt_learner(image_features)  # (B, n_base, L, D)
 
-            for i in range(B):
-                # Base class text features (learned, instance-conditional)
-                base_text_features = model.text_encoder(prompts[i], tokenized_prompts).float()
-                base_text_features = base_text_features / base_text_features.norm(dim=-1, keepdim=True)
+            # Vectorized text encoding for base classes
+            Bp, C, L, D = prompts.shape
+            prompts_flat = prompts.view(Bp * C, L, D)
+            tokens_expanded = tokenized_prompts.unsqueeze(0).expand(Bp, -1, -1).reshape(Bp * C, L).to(prompts_flat.device)
+            base_text_flat = model.text_encoder(prompts_flat, tokens_expanded).float()
+            base_text_features = base_text_flat.view(Bp, C, -1)
+            base_text_features = base_text_features / base_text_features.norm(dim=-1, keepdim=True)
 
-                # Combine with new class zero-shot features
-                all_text_features = torch.cat([base_text_features, new_text_features], dim=0)
+            # Combine with new class zero-shot features (expand new across batch)
+            new_exp = new_text_features.unsqueeze(0).expand(Bp, -1, -1)
+            all_text_features = torch.cat([base_text_features, new_exp], dim=1)  # (B, C+N_new, D)
 
-                # Classify against all classes (with logit_scale)
-                logits = logit_scale * image_features[i] @ all_text_features.T
-                pred = logits.argmax().item()
+            # Compute logits for whole batch
+            logits_batch = logit_scale * (image_features.unsqueeze(1) @ all_text_features.transpose(2, 1)).squeeze(1)  # (B, C+N_new)
+            preds = logits_batch.argmax(dim=1).tolist()
 
+            # Accumulate metrics (small Python loop over batch is fine)
+            for i in range(Bp):
+                pred = preds[i]
                 label = labels[i].item()
-
                 if label in base_classes:
                     total_base += 1
                     if pred == label_to_idx[label]:
                         correct_base += 1
-
                 elif label in new_classes:
                     total_new += 1
                     if pred == label_to_idx[label]:
