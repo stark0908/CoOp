@@ -150,34 +150,42 @@ class SimpleKANLayer(nn.Module):
 
         self.in_features = in_features
         self.out_features = out_features
+        self.hidden_dim = hidden_dim
 
-        # φ_ij functions: one small MLP per connection
-        self.phi = nn.ModuleList([
-            nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(1, hidden_dim),
-                    nn.ReLU(),
-                    nn.Linear(hidden_dim, 1)
-                )
-                for _ in range(out_features)
-            ])
-            for _ in range(in_features)
-        ])
+        # Instead of separate MLPs, use shared batched weights
+
+        # First layer: (in_features, out_features, hidden_dim)
+        self.W1 = nn.Parameter(torch.randn(in_features, out_features, hidden_dim))
+        self.b1 = nn.Parameter(torch.zeros(in_features, out_features, hidden_dim))
+
+        # Second layer: (in_features, out_features, hidden_dim)
+        self.W2 = nn.Parameter(torch.randn(in_features, out_features, hidden_dim))
+        self.b2 = nn.Parameter(torch.zeros(in_features, out_features))
 
     def forward(self, x):
-        # x: (batch_size, in_features)
-        outputs = []
+        """
+        x: (B, in_features)
+        """
 
-        for j in range(self.out_features):
-            y_j = 0
+        B = x.shape[0]
 
-            for i in range(self.in_features):
-                x_i = x[:, i].unsqueeze(1)     # (B, 1)
-                y_j = y_j + self.phi[i][j](x_i)
+        # Expand x → (B, in_features, 1, 1)
+        x_exp = x.unsqueeze(-1).unsqueeze(-1)
 
-            outputs.append(y_j)
+        # First layer
+        # (B, in_features, out_features, hidden_dim)
+        h = x_exp * self.W1 + self.b1
+        h = torch.relu(h)
 
-        return torch.cat(outputs, dim=1)  # (B, out_features)
+        # Second layer (reduce hidden_dim)
+        # (B, in_features, out_features)
+        h = (h * self.W2).sum(dim=-1) + self.b2
+
+        # Sum over input dimension
+        # (B, out_features)
+        y = h.sum(dim=1)
+
+        return y
 
 class MLPBlock(nn.Module):
     def __init__(self, in_dim, out_dim):
