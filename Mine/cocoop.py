@@ -13,8 +13,9 @@ import os
 
 DEVICE = "cuda:2" if torch.cuda.is_available() else "cpu"
 
-# Path to Eurosat data (override with env var `EUROSAT_ROOT`)
-DATA_ROOT = os.environ.get("EUROSAT_ROOT", "/home/23dcs505/data/eurosat")
+# Path to Eurosat data (override with env var `EUROSAT_ROOT`).
+# Default to torchvision-style local folder and allow automatic download.
+DATA_ROOT = os.environ.get("EUROSAT_ROOT", "./data")
 
 # ── Hyperparameters (per paper) ──────────────────────────────────
 NUM_SHOTS = 16
@@ -67,8 +68,8 @@ class EuroSATFewShot(Dataset):
         return img, label
 
 
-# Load full dataset & split classes
-dataset = EuroSAT(root=DATA_ROOT, download=False)
+# Load full dataset & split classes (use torchvision's downloader)
+dataset = EuroSAT(root=DATA_ROOT, download=True)
 
 all_classes = list(set([label for _, label in dataset]))
 random.shuffle(all_classes)
