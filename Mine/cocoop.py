@@ -155,6 +155,14 @@ class PromptLearnerCoCoOp(nn.Module):
             ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
         ]))
 
+        # Ensure meta-net uses the same dtype as CLIP (avoid Half/Float mismatches)
+        self.dtype = dtype
+        try:
+            self.meta_net = self.meta_net.to(dtype)
+        except Exception:
+            # Fallback: leave as-is; forward will cast inputs if necessary
+            pass
+
         # Tokenize class prompts (with period, matching original)
         classnames_clean = [name.replace("_", " ") for name in classnames]
         prompts_text = [f"a photo of a {name}." for name in classnames_clean]
@@ -247,6 +255,14 @@ scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
 criterion = nn.CrossEntropyLoss()
 
+# AMP (automatic mixed precision) support when running on CUDA
+USE_AMP = torch.cuda.is_available() and ("cuda" in DEVICE)
+if USE_AMP:
+    from torch.cuda.amp import GradScaler
+    scaler = GradScaler()
+else:
+    scaler = None
+
 
 # ── Zero-shot text features for new classes ──────────────────────
 def get_zeroshot_text_features(classnames_list):
@@ -272,12 +288,23 @@ def train_one_epoch(epoch):
         # Map labels → base class indices (0..4)
         labels = torch.tensor([base_classes.index(l) for l in labels]).to(DEVICE)
 
-        logits = model(images)
-        loss = criterion(logits, labels)
+        # Forward / backward with autocast when using AMP
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                logits = model(images)
+                loss = criterion(logits, labels)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(images)
+            loss = criterion(logits, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
         total_loss += loss.item()
         n_batches += 1
@@ -320,12 +347,18 @@ def evaluate():
             images = images.to(DEVICE)
             B = images.shape[0]
 
-            # Get image features
-            image_features = model.image_encoder(images.type(model.dtype)).float()
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-
-            # Get instance-conditional prompts for base classes
-            prompts = model.prompt_learner(image_features)  # (B, n_base, L, D)
+            # Get image features (use autocast when AMP is enabled)
+            if USE_AMP:
+                with torch.cuda.amp.autocast():
+                    image_features = model.image_encoder(images.type(model.dtype)).float()
+                    image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                    # Get instance-conditional prompts for base classes
+                    prompts = model.prompt_learner(image_features)  # (B, n_base, L, D)
+            else:
+                image_features = model.image_encoder(images.type(model.dtype)).float()
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+                # Get instance-conditional prompts for base classes
+                prompts = model.prompt_learner(image_features)  # (B, n_base, L, D)
 
             for i in range(B):
                 # Base class text features (learned, instance-conditional)
