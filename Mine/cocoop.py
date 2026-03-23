@@ -287,7 +287,7 @@ def train_one_epoch(epoch):
         images = images.to(DEVICE)
         # Map labels → indices in ALL classes (consistent with model outputs)
         label_map = {c: i for i, c in enumerate(all_classes)}
-        labels = torch.tensor([label_map[l] for l in labels]).to(DEVICE)
+        labels = torch.tensor([label_map[int(l.item())] for l in labels]).to(DEVICE)
 
         # Forward / backward with autocast when using AMP
         if scaler is not None:
