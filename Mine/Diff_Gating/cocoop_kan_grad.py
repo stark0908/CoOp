@@ -283,7 +283,8 @@ class MetaNet_Gated(nn.Module):
 
         # 🔴 Save full gate (for gradient debugging)
         self.last_g_full = g
-        self.last_g_full.retain_grad()
+        if g.requires_grad:
+            self.last_g_full.retain_grad()
 
         # Logging stats (detached)
         g_detach = g.detach()
