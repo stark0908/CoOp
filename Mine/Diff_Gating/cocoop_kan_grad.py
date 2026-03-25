@@ -248,7 +248,7 @@ class MetaNet_Concat(nn.Module):
         return self.fusion(combined)
 
 class MetaNet_Gated(nn.Module):
-    def __init__(self, vis_dim, ctx_dim):
+    def __init__(self, vis_dim, ctx_dim, temperature=2.0):
         super().__init__()
         bottleneck = max(vis_dim // 16, 4)
 
@@ -260,20 +260,37 @@ class MetaNet_Gated(nn.Module):
         # Gate decides importance of ANN vs KAN
         self.gate = nn.Linear(bottleneck, ctx_dim)
 
+        # Proper bias initialization (break symmetry)
+        nn.init.constant_(self.gate.bias, 1.0)   # try 1.0 or -1.0
+
+        # Temperature for stability
+        self.temperature = temperature
+
     def forward(self, x):
         x = self.reduce(x)
 
         ann_out = self.ann(x)
         kan_out = self.kan(x)
 
-        g = torch.sigmoid(self.gate(x + 1))  # (B, ctx_dim)
+        # Stable logits
+        logits = self.gate(x)
 
-        # Save gate stats for logging
-        self.last_g = g.detach()
-        self.last_g_mean = self.last_g.mean().item()
-        self.last_g_std = self.last_g.std().item()
-        self.last_g_min = self.last_g.min().item()
-        self.last_g_max = self.last_g.max().item()
+        # Optional: clamp to avoid extreme values
+        logits = torch.clamp(logits, -10, 10)
+
+        # Temperature-scaled sigmoid
+        g = torch.sigmoid(logits / self.temperature)  # (B, ctx_dim)
+
+        # 🔴 Save full gate (for gradient debugging)
+        self.last_g_full = g
+        self.last_g_full.retain_grad()
+
+        # Logging stats (detached)
+        g_detach = g.detach()
+        self.last_g_mean = g_detach.mean().item()
+        self.last_g_std  = g_detach.std().item()
+        self.last_g_min  = g_detach.min().item()
+        self.last_g_max  = g_detach.max().item()
 
         # convex combination
         return g * ann_out + (1 - g) * kan_out
@@ -454,85 +471,115 @@ def train_one_epoch(epoch):
     n_batches = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Train]", leave=False)
+
+    # Gate stats
     gate_sum = 0.0
+    gate_std_sum = 0.0
     gate_steps = 0
-    gate_grad_sum = 0.0
-    gate_grad_norm_sum = 0.0
+
+    # Gate gradient stats (OUTPUT gradients, not weights)
+    gate_grad_mean_sum = 0.0
+    gate_grad_std_sum = 0.0
     gate_grad_steps = 0
 
     for images, labels in pbar:
         images = images.to(DEVICE)
-        # labels are original dataset class ids (ints). Map to base-relative indices for loss.
         labels = labels.to(DEVICE)
         labels_rel = label_map_tensor[labels].to(DEVICE)
 
-        # Forward / backward with autocast when using AMP
+        optimizer.zero_grad()
+
+        # ===================== FORWARD =====================
         if scaler is not None:
             with torch.amp.autocast(device_type='cuda'):
-                logits = model(images)                           # (B, n_all)
-                logits_base = logits[:, :len(base_classes)]     # only base-class logits
+                logits = model(images)
+                logits_base = logits[:, :len(base_classes)]
                 loss = criterion(logits_base, labels_rel)
 
-            optimizer.zero_grad()
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
         else:
             logits = model(images)
             logits_base = logits[:, :len(base_classes)]
             loss = criterion(logits_base, labels_rel)
 
-            optimizer.zero_grad()
             loss.backward()
+
+        # ===================== GATE DEBUG =====================
+        meta_net = model.prompt_learner.meta_net
+
+        if hasattr(meta_net, "last_g_full"):
+            g = meta_net.last_g_full
+
+            # Gate output stats
+            gate_sum += g.detach().mean().item()
+            gate_std_sum += g.detach().std().item()
+            gate_steps += 1
+
+            # Gate gradient stats
+            if g.grad is not None:
+                gate_grad_mean_sum += g.grad.mean().item()
+                gate_grad_std_sum += g.grad.std().item()
+                gate_grad_steps += 1
+            else:
+                print(" gate grad is None")
+
+        # ===================== STABILITY =====================
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        # ===================== OPTIMIZER =====================
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
             optimizer.step()
 
         total_loss += loss.item()
-
-        # Track gate usage for this batch from MetaNet_Gated
-        if hasattr(model.prompt_learner.meta_net, 'last_g_mean'):
-            gate_sum += model.prompt_learner.meta_net.last_g_mean
-            gate_steps += 1
-
-        # Track gate gradients to verify updates
-        if model.prompt_learner.meta_net.gate.weight.grad is not None:
-            gate_grad_norm = model.prompt_learner.meta_net.gate.weight.grad.norm().item()
-            gate_grad_sum += gate_grad_norm
-            gate_grad_norm_sum += gate_grad_norm ** 2
-            gate_grad_steps += 1
-
         n_batches += 1
-        avg_gate_grad = (gate_grad_sum / gate_grad_steps) if gate_grad_steps else 0.0
-        pbar.set_postfix(loss=f"{total_loss/n_batches:.4f}", gate=f"{(gate_sum/gate_steps) if gate_steps else 0:.4f}", g_grad=f"{avg_gate_grad:.6f}")
+
+        # ===================== LOG =====================
+        avg_loss = total_loss / n_batches
+        avg_gate = gate_sum / max(gate_steps, 1)
+        avg_gate_std = gate_std_sum / max(gate_steps, 1)
+        avg_gate_grad = gate_grad_mean_sum / max(gate_grad_steps, 1)
+
+        pbar.set_postfix(
+            loss=f"{avg_loss:.4f}",
+            gate=f"{avg_gate:.4f}",
+            g_std=f"{avg_gate_std:.4f}",
+            g_grad=f"{avg_gate_grad:.6f}"
+        )
 
     pbar.close()
 
-    # expose mean gate value and gradient stats for epoch in return tuple
+    # ===================== EPOCH STATS =====================
+    epoch_loss = total_loss / max(n_batches, 1)
     epoch_gate_mean = gate_sum / max(gate_steps, 1)
-    epoch_gate_grad_mean = gate_grad_sum / max(gate_grad_steps, 1)
-    epoch_gate_grad_std = (gate_grad_norm_sum / max(gate_grad_steps, 1)) ** 0.5 if gate_grad_steps > 0 else 0.0
-    return total_loss / max(n_batches, 1), epoch_gate_mean, epoch_gate_grad_mean, epoch_gate_grad_std
+    epoch_gate_std = gate_std_sum / max(gate_steps, 1)
+    epoch_gate_grad_mean = gate_grad_mean_sum / max(gate_grad_steps, 1)
+    epoch_gate_grad_std = gate_grad_std_sum / max(gate_grad_steps, 1)
 
+    return (
+        epoch_loss,
+        epoch_gate_mean,
+        epoch_gate_std,
+        epoch_gate_grad_mean,
+        epoch_gate_grad_std
+    )
 
 base_classes_tensor = torch.tensor(base_classes, device=DEVICE)
 new_classes_tensor  = torch.tensor(new_classes, device=DEVICE)
 
 
 def evaluate():
-    """
-    Evaluate on ALL test data.
-    CoCoOp generates instance-conditional prompts, so for base classes
-    we use the learned prompt+meta-net via custom TextEncoder.
-    For new classes we use zero-shot CLIP.
-
-    All images classified against all 10 classes.
-    Returns (base_acc, new_acc, harmonic_mean)
-    """
     model.eval()
 
     correct_base = 0
     total_base = 0
     correct_new = 0
     total_new = 0
+
+    gate_eval_sum = 0
+    gate_eval_steps = 0
 
     with torch.no_grad():
         pbar = tqdm(test_loader, desc=f"         [Eval] ", leave=False)
@@ -541,52 +588,49 @@ def evaluate():
             images = images.to(DEVICE)
             labels = labels.to(DEVICE)
 
-            # forward
-            if USE_AMP:
-                with torch.amp.autocast(device_type='cuda'):
-                    logits_batch = model(images)
-            else:
-                logits_batch = model(images)
+            #  No AMP in eval
+            logits_batch = model(images)
 
             preds = logits_batch.argmax(dim=1)
 
-            # fast label mapping (NO python loop)
+            # label mapping
             label_indices = label_map_tensor_all[labels]
 
             # masks
             base_mask = torch.isin(labels, base_classes_tensor)
             new_mask  = torch.isin(labels, new_classes_tensor)
 
-            # correctness
             correct = (preds == label_indices)
 
-            # accumulate
             correct_base += (correct & base_mask).sum().item()
             total_base   += base_mask.sum().item()
 
             correct_new  += (correct & new_mask).sum().item()
             total_new    += new_mask.sum().item()
 
+            #  Track gate during eval
+            meta_net = model.prompt_learner.meta_net
+            if hasattr(meta_net, "last_g_mean"):
+                gate_eval_sum += meta_net.last_g_mean
+                gate_eval_steps += 1
+
     base_acc = correct_base / max(total_base, 1)
     new_acc  = correct_new / max(total_new, 1)
 
-    if base_acc + new_acc > 0:
-        h = 2 * base_acc * new_acc / (base_acc + new_acc)
-    else:
-        h = 0.0
+    h = 2 * base_acc * new_acc / (base_acc + new_acc) if (base_acc + new_acc) > 0 else 0.0
 
-    return base_acc, new_acc, h
+    gate_eval_mean = gate_eval_sum / max(gate_eval_steps, 1)
+
+    return base_acc, new_acc, h, gate_eval_mean
 
 
 def train_and_evaluate():
     print("Gated Bias towards KAN")
 
-    
-    if(clip_model.visual.proj.requires_grad):
+    if clip_model.visual.proj.requires_grad:
         print("Visual projection is trainable.")
     else:
-        print("Visual projection is frozen.")  
-
+        print("Visual projection is frozen.")
 
     print(f"\n{'='*50}")
     print("Run settings:")
@@ -598,21 +642,29 @@ def train_and_evaluate():
     print(f"  Shots     : {NUM_SHOTS}")
     print(f"  LR        : {LR}")
     print(f"{'='*50}\n")
+
     print(f"CoCoOp Training — {EPOCHS} epochs, {NUM_SHOTS}-shot")
     print(f"Base: {[EUROSAT_CLASSES[c] for c in base_classes]}")
     print(f"New:  {[EUROSAT_CLASSES[c] for c in new_classes]}")
     print(f"{'='*50}\n")
 
     for epoch in range(EPOCHS):
-        # Warmup: fix lr at 1e-5 for first epoch
+
+        # Warmup
         if epoch == 0:
             for pg in optimizer.param_groups:
                 pg['lr'] = WARMUP_LR
 
-        # Train
-        avg_loss, epoch_gate_mean, epoch_gate_grad_mean, epoch_gate_grad_std = train_one_epoch(epoch)
+        # ===================== TRAIN =====================
+        (
+            avg_loss,
+            epoch_gate_mean,
+            epoch_gate_std,
+            epoch_gate_grad_mean,
+            epoch_gate_grad_std
+        ) = train_one_epoch(epoch)
 
-        # Step scheduler (after warmup epoch)
+        # ===================== LR SCHEDULER =====================
         if epoch == 0:
             for pg in optimizer.param_groups:
                 pg['lr'] = LR
@@ -621,36 +673,40 @@ def train_and_evaluate():
 
         current_lr = optimizer.param_groups[0]['lr']
 
-        # Evaluate
-        base_acc, new_acc, h = evaluate()
+        # ===================== EVAL =====================
+        base_acc, new_acc, h, gate_eval_mean = evaluate()
 
-        # Log to stdout
+        # ===================== PRINT =====================
         print(f"{'='*15} Epoch {epoch+1:3d}/{EPOCHS} {'='*15}")
         print(f"  Train Loss : {avg_loss:.4f}")
         print(f"  Gate mean  : {epoch_gate_mean:.4f}")
+        print(f"  Gate std   : {epoch_gate_std:.4f}")
         print(f"  Gate grad  : {epoch_gate_grad_mean:.6f} (std: {epoch_gate_grad_std:.6f})")
+        print(f"  Eval gate  : {gate_eval_mean:.4f}")
         print(f"  LR         : {current_lr:.6f}")
         print(f"  Base Acc   : {base_acc*100:.2f}%")
         print(f"  New Acc    : {new_acc*100:.2f}%")
         print(f"  H          : {h*100:.2f}%")
         print(f"{'='*42}")
 
-        # Log to wandb if available
+        # ===================== WANDB =====================
         if wandb is not None:
             wandb.log({
                 "train/loss": avg_loss,
                 "train/gate_mean": epoch_gate_mean,
+                "train/gate_std": epoch_gate_std,
                 "train/gate_grad_mean": epoch_gate_grad_mean,
                 "train/gate_grad_std": epoch_gate_grad_std,
                 "train/lr": current_lr,
                 "eval/base_acc": base_acc,
                 "eval/new_acc": new_acc,
                 "eval/h": h,
+                "eval/gate_mean": gate_eval_mean,
                 "epoch": epoch + 1,
                 "timestamp": time.time()
             }, step=epoch + 1)
 
-    # Finish wandb run
+    # ===================== CLEANUP =====================
     if wandb is not None:
         try:
             wandb.finish()
